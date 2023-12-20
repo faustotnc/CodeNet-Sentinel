@@ -42,8 +42,9 @@ class PositionalEncoder(torch.nn.Module):
 
         # Compute the positional encodings once in advance
         position = torch.arange(0, max_len).unsqueeze(1).float()
-        div_term = torch.exp(torch.arange(
-            0, n_dim, 2).float() * -(math.log(10000.0) / n_dim))
+        div_term = torch.exp(
+            torch.arange(0, n_dim, 2).float() * -(math.log(10000.0) / n_dim)
+        )
         pos_enc = torch.zeros((max_len, n_dim))
         pos_enc[:, 0::2] = torch.sin(position * div_term)
         pos_enc[:, 1::2] = torch.cos(position * div_term)

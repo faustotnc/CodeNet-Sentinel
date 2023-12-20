@@ -15,7 +15,7 @@ class ModelConfig:
     batch_size: int = 10
     max_instruction_len: int = 768
     max_seq_len: int = 768
-    overlap_size: int = 128
+    overlap_size: int = 8 # Number of overlapped tokens in tokenization
     val_split: float = 0.1
     shuffle_dataset: bool = True
     save_data_to: str = None  # Specified in notebook

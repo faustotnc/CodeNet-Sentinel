@@ -33,30 +33,19 @@ class DecoderDataset(Dataset):
 
 class DecoderBlock(torch.nn.Module):
     def __init__(self, n_head, n_dim, max_seq_len, mlp_dropout=0.0, attn_dropout=0.0, bias=False):
-        """
-        Initialize the DecoderBlock.
-
-        Parameters:
-            n_head (int): The number of attention heads.
-            n_dim (int): The dimension of input features.
-            max_seq_len (int): The maximum sequence length for creating the causal mask.
-            mlp_dropout (float, optional): The dropout rate for the MLP layers. Defaults to 0.0.
-            attn_dropout (float, optional): The dropout rate for the attention layers. Defaults to 0.0.
-            bias (bool, optional): Whether to include a bias term. Defaults to False.
-        """
         super().__init__()
 
         # Layers for causal multi-head attention
-        self.causal_multihead_attn_norm = LayerNormWithBias(n_dim, bias)
-        self.causal_multihead_attention = MultiheadAttention(
+        self.causal_mha_norm = LayerNormWithBias(n_dim, bias)
+        self.causal_mha = MultiheadAttention(
             n_dim, n_head, dropout=attn_dropout, batch_first=True)
-        self.causal_multihead_attn_dropout = torch.nn.Dropout(mlp_dropout)
+        self.causal_mha_dropout = torch.nn.Dropout(mlp_dropout)
 
         # Layers for standard multi-head attention
-        self.multihead_attn_norm = LayerNormWithBias(n_dim, bias)
-        self.multihead_attention = MultiheadAttention(
-            n_dim, n_head, batch_first=True)
-        self.multihead_attn_dropout = torch.nn.Dropout(mlp_dropout)
+        self.mem_mha_norm = LayerNormWithBias(n_dim, bias)
+        self.mem_mha = MultiheadAttention(
+            n_dim, n_head, dropout=attn_dropout, batch_first=True)
+        self.mem_mha_dropout = torch.nn.Dropout(mlp_dropout)
 
         # Layers for feedforward network
         self.feed_forward_norm = LayerNormWithBias(n_dim, bias)
@@ -65,55 +54,44 @@ class DecoderBlock(torch.nn.Module):
 
         # Registering the causal mask as a buffer
         self.register_buffer('causal_mask', torch.triu(
-            torch.ones((max_seq_len, max_seq_len)), diagonal=1).bool())
+            torch.ones((max_seq_len, max_seq_len)),
+            diagonal=1
+        ).bool())
 
-    def forward(self, x, tgt_key_pad_mask, memory=None, memory_key_pad_mask=None, is_causal=True):
-        """
-        Forward pass of the decoder block.
-
-        Parameters:
-            x (torch.Tensor): The input tensor to the decoder block.
-            tgt_key_pad_mask (torch.Tensor): The target key padding mask tensor for self-attention.
-            memory (torch.Tensor, optional): The tensor from the encoder to be used in the 
-                                              standard attention layer.
-            memory_key_pad_mask (torch.Tensor, optional): The key padding mask for the encoder's 
-                                                          tensor.
-            is_causal (bool, optional): Whether to apply the causal mask for self-attention. 
-                                        Defaults to True.
-
-        Returns:
-            torch.Tensor: The output tensor of the decoder block.
-        """
+    def forward(self, x, pad_mask, memory=None, mem_pad_mask=None, is_causal=True):
         # Causal multi-head attention with residual connection and dropout
-        causal_mha_norm = self.causal_multihead_attn_norm(x)
-        causal_mha_out, _ = self.causal_multihead_attention(
-            query=causal_mha_norm,
-            key=causal_mha_norm,
-            value=causal_mha_norm,
-            key_padding_mask=tgt_key_pad_mask,
-            attn_mask=self.causal_mask[:x.shape[1],
-                                       :x.shape[1]] if is_causal else None,
+        causal_mha_norm = self.causal_mha_norm(x)
+        causal_mha_out, _ = self.causal_mha(
+            query=causal_mha_norm,  # What we're looking for
+            value=causal_mha_norm,  # Everything we have
+            key=causal_mha_norm,  # What we actually have access to (masked)
+            key_padding_mask=pad_mask,
+            attn_mask=self.causal_mask[
+                :x.shape[1],
+                :x.shape[1]
+            ] if is_causal else None,
         )
-        causal_multi_head_attn = x + \
-            self.causal_multihead_attn_dropout(causal_mha_out)
+        causal_mha = causal_mha_norm + self.causal_mha_dropout(causal_mha_out)
 
-        # Standard multi-head attention with residual connection and dropout
-        mha_norm = self.multihead_attn_norm(causal_multi_head_attn)
-        mha_out, _ = self.multihead_attention(
-            query=mha_norm,
-            key=mha_norm if memory is None else memory,
-            value=mha_norm if memory is None else memory,
-            key_padding_mask=tgt_key_pad_mask if memory is None else memory_key_pad_mask
-        )
-        multi_head_attn = causal_multi_head_attn + \
-            self.multihead_attn_dropout(mha_out)
+        if memory is not None:
+            # Memory multi-head attention with residual connection and dropout
+            mem_mha_norm = self.mem_mha_norm(causal_mha)
+            mem_mha_out, _ = self.mem_mha(
+                query=causal_mha,
+                key=memory,
+                value=memory,
+                key_padding_mask=mem_pad_mask
+            )
+            decoder_out = mem_mha_norm + self.mem_mha_dropout(mem_mha_out)
+        else:
+            decoder_out = causal_mha
 
         # Feedforward network with residual connection and dropout
-        ff_norm = self.feed_forward_norm(multi_head_attn)
-        ff_out = self.feed_forward(ff_norm)
-        output = multi_head_attn + self.feed_forward_dropout(ff_out)
+        feed_forward_norm = self.feed_forward_norm(decoder_out)
+        feed_forward_out = self.feed_forward(feed_forward_norm)
+        feed_forward = decoder_out + self.feed_forward_dropout(ff_out)
 
-        return output
+        return feed_forward
 
 
 class DecoderModel(L.LightningModule):
@@ -125,6 +103,7 @@ class DecoderModel(L.LightningModule):
             weight_decay, beta1, beta2, bias=False, log_interval=1
     ):
         super().__init__()
+        self.learning_rate = learning_rate
         self.save_hyperparameters()
 
         self.criterion = torch.nn.CrossEntropyLoss(
@@ -147,22 +126,31 @@ class DecoderModel(L.LightningModule):
         self.pos_encoder = PositionalEncoder(n_dim, max_seq_len)
         self.final_linear = torch.nn.Linear(n_dim, vocab_size)
 
-    def forward(self, x, tgt_key_pad_mask, memory=None, memory_key_pad_mask=None):
+    def forward(self, x, pad_mask, memory=None, mem_pad_mask=None):
         x = self.pos_encoder(self.embedding(x))
 
         for layer in self.decoder_layers:
-            x = layer(x, tgt_key_pad_mask, memory, memory_key_pad_mask)
+            x = layer(x, pad_mask, memory, mem_pad_mask)
 
         logits = self.final_linear(x)
         return logits
 
     def training_step(self, batch):
+        self.log(
+            "trainer/learning_rate", self.learning_rate,
+            on_step=True, on_epoch=True, logger=True
+        )
+
         _, loss, _ = self._compute_and_log_metrics(batch, "train")
         return loss
 
     def validation_step(self, batch):
         _, loss, _ = self._compute_and_log_metrics(
-            batch, "validation", on_step=False)
+            batch=batch,
+            prefix="validation",
+            on_step=False
+        )
+
         return loss
 
     def test_step(self, batch):
@@ -171,7 +159,7 @@ class DecoderModel(L.LightningModule):
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(
             params=self.parameters(),
-            lr=self.hparams.learning_rate,
+            lr=self.learning_rate,
             weight_decay=self.hparams.weight_decay,
             betas=(self.hparams.beta1, self.hparams.beta2),
         )
@@ -187,7 +175,7 @@ class DecoderModel(L.LightningModule):
             "lr_scheduler": {
                 "scheduler": scheduler,
                 "interval": "step",
-                "frequency": self.hparams.log_interval,
+                "frequency": 1,
                 "monitor": "validation_loss",
                 "strict": True,
             }
