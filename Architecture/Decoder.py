@@ -1,7 +1,9 @@
 import torch
+import copy
+import lightning as L
 from torch.nn import MultiheadAttention
-from . import LayerNormWithBias, FeedForward
 from torch.utils.data import Dataset
+from . import LayerNormWithBias, FeedForward, PositionalEncoder, Tokenizer
 
 
 class DecoderDataset(Dataset):
@@ -112,5 +114,131 @@ class DecoderBlock(torch.nn.Module):
         output = multi_head_attn + self.feed_forward_dropout(ff_out)
 
         return output
-    
 
+
+class DecoderModel(L.LightningModule):
+    def __init__(
+            self, decoder_block,
+            # Hyperparameters and Config
+            n_layers, n_head, n_dim, max_seq_len, mlp_dropout, attn_dropout,
+            vocab_size, learning_rate, min_learning_rate,
+            weight_decay, beta1, beta2, bias=False, log_interval=1
+    ):
+        super().__init__()
+        self.save_hyperparameters()
+
+        self.criterion = torch.nn.CrossEntropyLoss(
+            ignore_index=Tokenizer.pad_token_id
+        )
+
+        dec = decoder_block(
+            n_head,
+            n_dim,
+            max_seq_len,
+            mlp_dropout,
+            attn_dropout,
+            bias
+        )
+
+        self.decoder_layers = torch.nn.ModuleList(
+            [copy.deepcopy(dec) for _ in range(n_layers)]
+        )
+        self.embedding = torch.nn.Embedding(vocab_size, n_dim)
+        self.pos_encoder = PositionalEncoder(n_dim, max_seq_len)
+        self.final_linear = torch.nn.Linear(n_dim, vocab_size)
+
+    def forward(self, x, tgt_key_pad_mask, memory=None, memory_key_pad_mask=None):
+        x = self.pos_encoder(self.embedding(x))
+
+        for layer in self.decoder_layers:
+            x = layer(x, tgt_key_pad_mask, memory, memory_key_pad_mask)
+
+        logits = self.final_linear(x)
+        return logits
+
+    def training_step(self, batch):
+        _, loss, _ = self._compute_and_log_metrics(batch, "train")
+        return loss
+
+    def validation_step(self, batch):
+        _, loss, _ = self._compute_and_log_metrics(
+            batch, "validation", on_step=False)
+        return loss
+
+    def test_step(self, batch):
+        self._compute_and_log_metrics(batch, "test")
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.AdamW(
+            params=self.parameters(),
+            lr=self.hparams.learning_rate,
+            weight_decay=self.hparams.weight_decay,
+            betas=(self.hparams.beta1, self.hparams.beta2),
+        )
+
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer=optimizer,
+            patience=10,
+            min_lr=self.hparams.min_learning_rate,
+        )
+
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+                "frequency": self.hparams.log_interval,
+                "monitor": "validation_loss",
+                "strict": True,
+            }
+        }
+
+    def _compute_and_log_metrics(self, batch, prefix, on_step=True, on_epoch=True):
+        logits = self(batch["inputs"], batch["attn_masks"])
+        loss = self._compute_loss(logits, batch["targets"])
+        acc = self._compute_accuracy(logits, batch["targets"])
+
+        self.log_dict(
+            {f"{prefix}_loss": loss, f"{prefix}_accuracy":  acc},
+            on_step=on_step, on_epoch=on_epoch, logger=True
+        )
+
+        return logits, loss, acc
+
+    def _compute_loss(self, logits, targets):
+        return self.criterion(logits.view(-1, logits.size(-1)), targets.view(-1))
+
+    def _compute_accuracy(self, logits, targets):
+        # Get the index of the maximum logit as the predicted token
+        _, predicted = torch.max(logits, dim=-1)
+
+        # Mask out padding positions
+        non_padding_mask = (targets != Tokenizer.pad_token_id)
+        total_non_padding = non_padding_mask.sum().item()
+
+        correct_predictions = (
+            predicted[non_padding_mask] == targets[non_padding_mask]
+        ).sum().item()
+
+        accuracy = correct_predictions / total_non_padding if total_non_padding > 0 else 0.0
+
+        return accuracy
+
+    def _generate(self, src, max_new_tokens):
+        for _ in range(max_new_tokens):
+            # crop idx to the last block_size tokens
+            idx_cond = src[-self.hparams.max_seq_len:]
+
+            logits = self(idx_cond, None)
+            logits = logits[:, -1]
+
+            probs = torch.nn.functional.softmax(logits, dim=-1)
+            idx_next = torch.multinomial(probs, num_samples=1)
+
+            # append sampled index to the running sequence
+            src = torch.cat((src, idx_next), dim=1)
+
+            if idx_next[0][0] == Tokenizer.eos_token_id:
+                break
+
+        return src
