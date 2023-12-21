@@ -41,7 +41,7 @@ class DecoderBlock(torch.nn.Module):
             n_dim, n_head, dropout=attn_dropout, batch_first=True)
         self.causal_mha_dropout = torch.nn.Dropout(mlp_dropout)
 
-        # Layers for standard multi-head attention
+        # Layers for memory multi-head attention
         self.mem_mha_norm = LayerNormWithBias(n_dim, bias)
         self.mem_mha = MultiheadAttention(
             n_dim, n_head, dropout=attn_dropout, batch_first=True)
@@ -63,7 +63,7 @@ class DecoderBlock(torch.nn.Module):
         causal_mha_norm = self.causal_mha_norm(x)
         causal_mha_out, _ = self.causal_mha(
             query=causal_mha_norm,  # What we're looking for
-            value=causal_mha_norm,  # Everything we have
+            value=causal_mha_norm,  # Everything we have available
             key=causal_mha_norm,  # What we actually have access to (masked)
             key_padding_mask=pad_mask,
             attn_mask=self.causal_mask[
@@ -71,25 +71,25 @@ class DecoderBlock(torch.nn.Module):
                 :x.shape[1]
             ] if is_causal else None,
         )
-        causal_mha = causal_mha_norm + self.causal_mha_dropout(causal_mha_out)
+        causal_mha = x + self.causal_mha_dropout(causal_mha_out)
 
         if memory is not None:
             # Memory multi-head attention with residual connection and dropout
-            mem_mha_norm = self.mem_mha_norm(causal_mha)
             mem_mha_out, _ = self.mem_mha(
-                query=causal_mha,
+                query=self.mem_mha_norm(causal_mha),
                 key=memory,
                 value=memory,
                 key_padding_mask=mem_pad_mask
             )
-            decoder_out = mem_mha_norm + self.mem_mha_dropout(mem_mha_out)
+            decoder_out = causal_mha + self.mem_mha_dropout(mem_mha_out)
         else:
             decoder_out = causal_mha
 
         # Feedforward network with residual connection and dropout
         feed_forward_norm = self.feed_forward_norm(decoder_out)
         feed_forward_out = self.feed_forward(feed_forward_norm)
-        feed_forward = decoder_out + self.feed_forward_dropout(ff_out)
+        feed_forward = decoder_out + \
+            self.feed_forward_dropout(feed_forward_out)
 
         return feed_forward
 
@@ -176,7 +176,7 @@ class DecoderModel(L.LightningModule):
                 "scheduler": scheduler,
                 "interval": "step",
                 "frequency": 1,
-                "monitor": "validation_loss",
+                "monitor": "train_loss_step",
                 "strict": True,
             }
         }
@@ -215,7 +215,7 @@ class DecoderModel(L.LightningModule):
     def _generate(self, src, max_new_tokens):
         for _ in range(max_new_tokens):
             # crop idx to the last block_size tokens
-            idx_cond = src[-self.hparams.max_seq_len:]
+            idx_cond = src[:, -self.hparams.max_seq_len:]
 
             logits = self(idx_cond, None)
             logits = logits[:, -1]
