@@ -256,3 +256,5 @@ $RECYCLE.BIN/
 wandb
 *.pt
 *.ckpt
+*.ftr
+*.zip

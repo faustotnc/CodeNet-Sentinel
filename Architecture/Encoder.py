@@ -4,7 +4,7 @@ from . import LayerNormWithBias, FeedForward
 
 
 class EncoderBlock(torch.nn.Module):
-    def __init__(self, n_head, n_dim, mlp_dropout=0.0, attn_dropout=0.0, bias=False):
+    def __init__(self, n_head: int, n_dim: int, mlp_dropout: float = 0.0, attn_dropout: float = 0.0, bias: bool = False):
         """
         Initialize the EncoderBlock.
 
@@ -19,8 +19,7 @@ class EncoderBlock(torch.nn.Module):
 
         # Layer normalization and multi-head attention components
         self.multihead_attn_norm = LayerNormWithBias(n_dim, bias)
-        self.multihead_attention = MultiheadAttention(
-            n_dim, n_head, dropout=attn_dropout, batch_first=True)
+        self.multihead_attention = MultiheadAttention(n_dim, n_head, dropout=attn_dropout, batch_first=True)
         self.multihead_attn_dropout = torch.nn.Dropout(mlp_dropout)
 
         # Layer normalization and feedforward network components
@@ -41,8 +40,7 @@ class EncoderBlock(torch.nn.Module):
         """
         # Multi-head attention with residual connection and dropout
         mha_norm = self.multihead_attn_norm(x)
-        mha_out, _ = self.multihead_attention(
-            mha_norm, mha_norm, mha_norm, key_padding_mask=key_pad_mask)
+        mha_out, _ = self.multihead_attention(mha_norm, mha_norm, mha_norm, key_padding_mask=key_pad_mask)
         multi_head_attn = x + self.multihead_attn_dropout(mha_out)
 
         # Feedforward network with residual connection and dropout
